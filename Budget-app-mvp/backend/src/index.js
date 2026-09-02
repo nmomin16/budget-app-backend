@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-require('./db'); // ensures DB is initialized/seeded
+const { ready } = require('./db'); // ensures DB schema/seed is initialized
 const routes = require('./routes');
 
 const app = express();
@@ -13,6 +13,19 @@ app.use('/api', routes);
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => {
-  console.log(`Budget app backend listening on http://localhost:${PORT}`);
+// basic error handler so a rejected promise doesn't crash the process
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'internal server error' });
 });
+
+ready
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Budget app backend listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
