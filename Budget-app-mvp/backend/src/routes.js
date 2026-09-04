@@ -70,6 +70,8 @@ router.get('/years', async (req, res, next) => {
     res.json(years.sort((a, b) => b - a));
   } catch (e) {
     next(e);
+  }
+});
 
 // ---------- categories ----------
 router.get('/categories', async (req, res, next) => {
@@ -485,7 +487,3 @@ router.get('/dashboard/:year/:month', async (req, res, next) => {
 });
 
 module.exports = router;
-
-
-  }
-});
