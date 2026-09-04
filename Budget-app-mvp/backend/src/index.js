@@ -9,9 +9,20 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-app.use('/api', routes);
-
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// Simple shared-secret gate: every /api request (except /api/health above)
+// must send a matching X-API-Key header. Set API_SECRET as an env var in
+// Render, and the same value as VITE_API_SECRET when building the frontend.
+// If API_SECRET isn't set (e.g. local dev with no env vars), this is skipped.
+app.use('/api', (req, res, next) => {
+  const expected = process.env.API_SECRET;
+  if (!expected) return next();
+  if (req.get('X-API-Key') === expected) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+});
+
+app.use('/api', routes);
 
 // basic error handler so a rejected promise doesn't crash the process
 app.use((err, req, res, next) => {
