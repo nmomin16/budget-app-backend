@@ -52,6 +52,49 @@ async function qOne(sql, args = []) {
   return rows[0] || null;
 }
 
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
+
+function daysInMonth(year, month) {
+  return new Date(year, month, 0).getDate();
+}
+
+// Make sure every active recurring template has a generated transaction for
+// this year/month, as long as that month has already started (never
+// pre-populate future months before they happen). Safe to call repeatedly —
+// the unique index on (recurring_id, year, month) plus this existence check
+// keeps it from ever creating duplicates.
+async function ensureRecurringGenerated(year, month) {
+  const y = Number(year);
+  const m = Number(month);
+  const now = new Date();
+  const isPastOrCurrent = y < now.getFullYear() || (y === now.getFullYear() && m <= now.getMonth() + 1);
+  if (!isPastOrCurrent) return;
+
+  const templates = await q(
+    `SELECT * FROM recurring_transactions
+     WHERE active = 1 AND (start_year < ? OR (start_year = ? AND start_month <= ?))`,
+    [y, y, m]
+  );
+
+  for (const t of templates) {
+    const existing = await qOne(
+      'SELECT id FROM transactions WHERE recurring_id = ? AND year = ? AND month = ?',
+      [t.id, y, m]
+    );
+    if (existing) continue;
+
+    const day = Math.min(t.day_of_month, daysInMonth(y, m));
+    const date = `${y}-${pad(m)}-${pad(day)}`;
+    await db.execute({
+      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recurring', ?)`,
+      args: [date, y, m, t.amount, t.category_id, t.store, t.note, t.payment_method, t.id],
+    });
+  }
+}
+
 // ---------- years ----------
 router.get('/years', async (req, res, next) => {
   try {
@@ -291,10 +334,89 @@ router.post('/budgets/:year/:month', async (req, res, next) => {
   }
 });
 
+// ---------- recurring transactions ----------
+router.get('/recurring', async (req, res, next) => {
+  try {
+    const rows = await q(
+      `SELECT r.*, c.name as category_name, c.color as category_color
+       FROM recurring_transactions r LEFT JOIN categories c ON c.id = r.category_id
+       ORDER BY r.active DESC, r.day_of_month, r.id`
+    );
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post('/recurring', async (req, res, next) => {
+  try {
+    const { category_id, store, amount, note, payment_method, day_of_month, start_year, start_month } = req.body;
+    if (amount === undefined || !start_year || !start_month) {
+      return res.status(400).json({ error: 'amount, start_year, and start_month are required' });
+    }
+    const result = await db.execute({
+      sql: `INSERT INTO recurring_transactions
+            (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+      args: [
+        category_id || null,
+        store || null,
+        amount,
+        note || null,
+        payment_method || 'debit',
+        day_of_month || 1,
+        start_year,
+        start_month,
+      ],
+    });
+    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [num(result.lastInsertRowid)]);
+    res.json(row);
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.put('/recurring/:id', async (req, res, next) => {
+  try {
+    const existing = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [req.params.id]);
+    if (!existing) return res.status(404).json({ error: 'not found' });
+    const { category_id, store, amount, note, payment_method, day_of_month, active } = req.body;
+    await db.execute({
+      sql: `UPDATE recurring_transactions
+            SET category_id=?, store=?, amount=?, note=?, payment_method=?, day_of_month=?, active=?
+            WHERE id=?`,
+      args: [
+        category_id !== undefined ? category_id : existing.category_id,
+        store !== undefined ? store : existing.store,
+        amount !== undefined ? amount : existing.amount,
+        note !== undefined ? note : existing.note,
+        payment_method ?? existing.payment_method,
+        day_of_month ?? existing.day_of_month,
+        active !== undefined ? (active ? 1 : 0) : existing.active,
+        req.params.id,
+      ],
+    });
+    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [req.params.id]);
+    res.json(row);
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.delete('/recurring/:id', async (req, res, next) => {
+  try {
+    await db.execute({ sql: 'DELETE FROM recurring_transactions WHERE id = ?', args: [req.params.id] });
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
 // ---------- transactions ----------
 router.get('/transactions', async (req, res, next) => {
   try {
     const { year, month } = req.query;
+    if (year && month) await ensureRecurringGenerated(year, month);
     let rows;
     const base = `SELECT t.*, c.name as category_name, c.color as category_color, c.type as category_type
        FROM transactions t LEFT JOIN categories c ON c.id = t.category_id`;
@@ -313,14 +435,28 @@ router.get('/transactions', async (req, res, next) => {
 
 router.post('/transactions', async (req, res, next) => {
   try {
-    const { date, amount, category_id, store, note, payment_method } = req.body;
+    const { date, amount, category_id, store, note, payment_method, make_recurring } = req.body;
     if (!date || amount === undefined) {
       return res.status(400).json({ error: 'date and amount are required' });
     }
-    const [y, m] = date.split('-');
+    const [y, m, d] = date.split('-').map(Number);
+
+    // Optionally spin up a recurring template at the same time, and link
+    // this transaction to it as its first occurrence.
+    let recurringId = null;
+    if (make_recurring) {
+      const recurring = await db.execute({
+        sql: `INSERT INTO recurring_transactions
+              (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        args: [category_id || null, store || null, amount, note || null, payment_method || 'debit', d, y, m],
+      });
+      recurringId = num(recurring.lastInsertRowid);
+    }
+
     const result = await db.execute({
-      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')`,
+      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`,
       args: [
         date,
         Number(y),
@@ -330,6 +466,7 @@ router.post('/transactions', async (req, res, next) => {
         store || null,
         note || null,
         payment_method || 'debit',
+        recurringId,
       ],
     });
     const row = await qOne(
@@ -388,6 +525,7 @@ router.delete('/transactions/:id', async (req, res, next) => {
 router.get('/dashboard/:year/:month', async (req, res, next) => {
   try {
     const { year, month } = req.params;
+    await ensureRecurringGenerated(year, month);
 
     let settingsRow = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ?', [year, month]);
     if (!settingsRow) {
