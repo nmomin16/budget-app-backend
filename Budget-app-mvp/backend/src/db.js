@@ -44,6 +44,20 @@ CREATE TABLE IF NOT EXISTS budgets (
   UNIQUE(year, month, category_id)
 );
 
+CREATE TABLE IF NOT EXISTS recurring_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+  store TEXT,
+  amount REAL NOT NULL,
+  note TEXT,
+  payment_method TEXT DEFAULT 'debit',
+  day_of_month INTEGER NOT NULL DEFAULT 1,
+  start_year INTEGER NOT NULL,
+  start_month INTEGER NOT NULL,
+  active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   date TEXT NOT NULL,
@@ -55,6 +69,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   note TEXT,
   payment_method TEXT DEFAULT 'debit',
   source TEXT DEFAULT 'manual',
+  recurring_id INTEGER REFERENCES recurring_transactions(id) ON DELETE SET NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -91,8 +106,26 @@ const DEFAULT_CATEGORIES = [
   ['Savings', 'savings', '#ec4899', 20],
 ];
 
+async function ensureColumn(table, column, ddl) {
+  const { rows } = await db.execute(`PRAGMA table_info(${table})`);
+  const exists = rows.some((r) => r.name === column);
+  if (!exists) {
+    await db.execute(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+
 async function init() {
   await db.executeMultiple(SCHEMA);
+
+  // Migration for databases created before recurring transactions existed.
+  await ensureColumn(
+    'transactions',
+    'recurring_id',
+    "recurring_id INTEGER REFERENCES recurring_transactions(id) ON DELETE SET NULL"
+  );
+  await db.execute(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_recurring_month ON transactions(recurring_id, year, month) WHERE recurring_id IS NOT NULL'
+  );
 
   const { rows: catRows } = await db.execute('SELECT COUNT(*) as c FROM categories');
   if (Number(catRows[0].c) === 0) {
