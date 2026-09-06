@@ -65,7 +65,7 @@ function daysInMonth(year, month) {
 // pre-populate future months before they happen). Safe to call repeatedly —
 // the unique index on (recurring_id, year, month) plus this existence check
 // keeps it from ever creating duplicates.
-async function ensureRecurringGenerated(year, month) {
+async function ensureRecurringGenerated(userId, year, month) {
   const y = Number(year);
   const m = Number(month);
   const now = new Date();
@@ -74,23 +74,23 @@ async function ensureRecurringGenerated(year, month) {
 
   const templates = await q(
     `SELECT * FROM recurring_transactions
-     WHERE active = 1 AND (start_year < ? OR (start_year = ? AND start_month <= ?))`,
-    [y, y, m]
+     WHERE user_id = ? AND active = 1 AND (start_year < ? OR (start_year = ? AND start_month <= ?))`,
+    [userId, y, y, m]
   );
 
   for (const t of templates) {
     const existing = await qOne(
-      'SELECT id FROM transactions WHERE recurring_id = ? AND year = ? AND month = ?',
-      [t.id, y, m]
+      'SELECT id FROM transactions WHERE recurring_id = ? AND year = ? AND month = ? AND user_id = ?',
+      [t.id, y, m, userId]
     );
     if (existing) continue;
 
     const day = Math.min(t.day_of_month, daysInMonth(y, m));
     const date = `${y}-${pad(m)}-${pad(day)}`;
     await db.execute({
-      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recurring', ?)`,
-      args: [date, y, m, t.amount, t.category_id, t.store, t.note, t.payment_method, t.id],
+      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recurring', ?, ?)`,
+      args: [date, y, m, t.amount, t.category_id, t.store, t.note, t.payment_method, t.id, userId],
     });
   }
 }
@@ -98,14 +98,16 @@ async function ensureRecurringGenerated(year, month) {
 // ---------- years ----------
 router.get('/years', async (req, res, next) => {
   try {
+    const u = req.userId;
     const rows = await q(
       `SELECT DISTINCT year FROM (
-        SELECT year FROM transactions
+        SELECT year FROM transactions WHERE user_id = ?
         UNION
-        SELECT year FROM budgets
+        SELECT year FROM budgets WHERE user_id = ?
         UNION
-        SELECT year FROM monthly_settings
-      ) ORDER BY year DESC`
+        SELECT year FROM monthly_settings WHERE user_id = ?
+      ) ORDER BY year DESC`,
+      [u, u, u]
     );
     const years = rows.map((r) => r.year);
     const currentYear = new Date().getFullYear();
@@ -119,7 +121,10 @@ router.get('/years', async (req, res, next) => {
 // ---------- categories ----------
 router.get('/categories', async (req, res, next) => {
   try {
-    const rows = await q('SELECT * FROM categories WHERE archived = 0 ORDER BY type, sort_order, name');
+    const rows = await q(
+      'SELECT * FROM categories WHERE archived = 0 AND user_id = ? ORDER BY type, sort_order, name',
+      [req.userId]
+    );
     res.json(rows);
   } catch (e) {
     next(e);
@@ -133,10 +138,13 @@ router.post('/categories', async (req, res, next) => {
       return res.status(400).json({ error: 'name and valid type are required' });
     }
     const result = await db.execute({
-      sql: 'INSERT INTO categories (name, type, color, sort_order) VALUES (?, ?, ?, ?)',
-      args: [name, type, color || '#6366f1', sort_order || 0],
+      sql: 'INSERT INTO categories (name, type, color, sort_order, user_id) VALUES (?, ?, ?, ?, ?)',
+      args: [name, type, color || '#6366f1', sort_order || 0, req.userId],
     });
-    const row = await qOne('SELECT * FROM categories WHERE id = ?', [num(result.lastInsertRowid)]);
+    const row = await qOne('SELECT * FROM categories WHERE id = ? AND user_id = ?', [
+      num(result.lastInsertRowid),
+      req.userId,
+    ]);
     res.json(row);
   } catch (e) {
     next(e);
@@ -146,19 +154,23 @@ router.post('/categories', async (req, res, next) => {
 router.put('/categories/:id', async (req, res, next) => {
   try {
     const { name, type, color, sort_order } = req.body;
-    const existing = await qOne('SELECT * FROM categories WHERE id = ?', [req.params.id]);
+    const existing = await qOne('SELECT * FROM categories WHERE id = ? AND user_id = ?', [
+      req.params.id,
+      req.userId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'not found' });
     await db.execute({
-      sql: 'UPDATE categories SET name=?, type=?, color=?, sort_order=? WHERE id=?',
+      sql: 'UPDATE categories SET name=?, type=?, color=?, sort_order=? WHERE id=? AND user_id=?',
       args: [
         name ?? existing.name,
         type ?? existing.type,
         color ?? existing.color,
         sort_order ?? existing.sort_order,
         req.params.id,
+        req.userId,
       ],
     });
-    const row = await qOne('SELECT * FROM categories WHERE id = ?', [req.params.id]);
+    const row = await qOne('SELECT * FROM categories WHERE id = ? AND user_id = ?', [req.params.id, req.userId]);
     res.json(row);
   } catch (e) {
     next(e);
@@ -167,7 +179,10 @@ router.put('/categories/:id', async (req, res, next) => {
 
 router.delete('/categories/:id', async (req, res, next) => {
   try {
-    await db.execute({ sql: 'UPDATE categories SET archived = 1 WHERE id = ?', args: [req.params.id] });
+    await db.execute({
+      sql: 'UPDATE categories SET archived = 1 WHERE id = ? AND user_id = ?',
+      args: [req.params.id, req.userId],
+    });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -177,7 +192,9 @@ router.delete('/categories/:id', async (req, res, next) => {
 // ---------- stores ----------
 router.get('/stores', async (req, res, next) => {
   try {
-    const rows = await q('SELECT * FROM stores WHERE archived = 0 ORDER BY sort_order, name');
+    const rows = await q('SELECT * FROM stores WHERE archived = 0 AND user_id = ? ORDER BY sort_order, name', [
+      req.userId,
+    ]);
     res.json(rows);
   } catch (e) {
     next(e);
@@ -190,10 +207,13 @@ router.post('/stores', async (req, res, next) => {
     if (!name) return res.status(400).json({ error: 'name is required' });
     try {
       const result = await db.execute({
-        sql: 'INSERT INTO stores (name, default_category_id, is_preset, sort_order) VALUES (?, ?, 0, ?)',
-        args: [name, default_category_id || null, sort_order || 99],
+        sql: 'INSERT INTO stores (name, default_category_id, is_preset, sort_order, user_id) VALUES (?, ?, 0, ?, ?)',
+        args: [name, default_category_id || null, sort_order || 99, req.userId],
       });
-      const row = await qOne('SELECT * FROM stores WHERE id = ?', [num(result.lastInsertRowid)]);
+      const row = await qOne('SELECT * FROM stores WHERE id = ? AND user_id = ?', [
+        num(result.lastInsertRowid),
+        req.userId,
+      ]);
       res.json(row);
     } catch (e) {
       res.status(400).json({ error: 'store already exists' });
@@ -205,19 +225,20 @@ router.post('/stores', async (req, res, next) => {
 
 router.put('/stores/:id', async (req, res, next) => {
   try {
-    const existing = await qOne('SELECT * FROM stores WHERE id = ?', [req.params.id]);
+    const existing = await qOne('SELECT * FROM stores WHERE id = ? AND user_id = ?', [req.params.id, req.userId]);
     if (!existing) return res.status(404).json({ error: 'not found' });
     const { name, default_category_id, sort_order } = req.body;
     await db.execute({
-      sql: 'UPDATE stores SET name=?, default_category_id=?, sort_order=? WHERE id=?',
+      sql: 'UPDATE stores SET name=?, default_category_id=?, sort_order=? WHERE id=? AND user_id=?',
       args: [
         name ?? existing.name,
         default_category_id ?? existing.default_category_id,
         sort_order ?? existing.sort_order,
         req.params.id,
+        req.userId,
       ],
     });
-    const row = await qOne('SELECT * FROM stores WHERE id = ?', [req.params.id]);
+    const row = await qOne('SELECT * FROM stores WHERE id = ? AND user_id = ?', [req.params.id, req.userId]);
     res.json(row);
   } catch (e) {
     next(e);
@@ -226,7 +247,10 @@ router.put('/stores/:id', async (req, res, next) => {
 
 router.delete('/stores/:id', async (req, res, next) => {
   try {
-    await db.execute({ sql: 'UPDATE stores SET archived = 1 WHERE id = ?', args: [req.params.id] });
+    await db.execute({
+      sql: 'UPDATE stores SET archived = 1 WHERE id = ? AND user_id = ?',
+      args: [req.params.id, req.userId],
+    });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -237,14 +261,19 @@ router.delete('/stores/:id', async (req, res, next) => {
 router.get('/settings/:year/:month', async (req, res, next) => {
   try {
     const { year, month } = req.params;
-    let row = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ?', [year, month]);
+    const u = req.userId;
+    let row = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ? AND user_id = ?', [
+      year,
+      month,
+      u,
+    ]);
 
     if (!row) {
       row = await qOne(
         `SELECT * FROM monthly_settings
-         WHERE (year < ?) OR (year = ? AND month < ?)
+         WHERE user_id = ? AND ((year < ?) OR (year = ? AND month < ?))
          ORDER BY year DESC, month DESC LIMIT 1`,
-        [year, year, month]
+        [u, year, year, month]
       );
     }
     const settings = parseSettings(row);
@@ -264,8 +293,13 @@ router.get('/settings/:year/:month', async (req, res, next) => {
 router.post('/settings/:year/:month', async (req, res, next) => {
   try {
     const { year, month } = req.params;
+    const u = req.userId;
     const { income_sources, savings_goal_type, savings_goal_value } = req.body;
-    const existing = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ?', [year, month]);
+    const existing = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ? AND user_id = ?', [
+      year,
+      month,
+      u,
+    ]);
     const sourcesJson = JSON.stringify(income_sources || []);
     if (existing) {
       await db.execute({
@@ -274,8 +308,8 @@ router.post('/settings/:year/:month', async (req, res, next) => {
       });
     } else {
       await db.execute({
-        sql: 'INSERT INTO monthly_settings (year, month, income_sources, savings_goal_type, savings_goal_value) VALUES (?, ?, ?, ?, ?)',
-        args: [year, month, sourcesJson, savings_goal_type || 'fixed', savings_goal_value || 0],
+        sql: 'INSERT INTO monthly_settings (year, month, income_sources, savings_goal_type, savings_goal_value, user_id) VALUES (?, ?, ?, ?, ?, ?)',
+        args: [year, month, sourcesJson, savings_goal_type || 'fixed', savings_goal_value || 0, u],
       });
     }
     res.json({ ok: true });
@@ -288,18 +322,26 @@ router.post('/settings/:year/:month', async (req, res, next) => {
 router.get('/budgets/:year/:month', async (req, res, next) => {
   try {
     const { year, month } = req.params;
-    const categories = await q('SELECT * FROM categories WHERE archived = 0 ORDER BY type, sort_order, name');
-    const budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ?', [year, month]);
+    const u = req.userId;
+    const categories = await q(
+      'SELECT * FROM categories WHERE archived = 0 AND user_id = ? ORDER BY type, sort_order, name',
+      [u]
+    );
+    const budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ? AND user_id = ?', [
+      year,
+      month,
+      u,
+    ]);
     const byCategory = Object.fromEntries(budgetRows.map((b) => [b.category_id, b.amount]));
 
     let inherited = false;
     if (budgetRows.length === 0) {
       const prior = await q(
         `SELECT * FROM budgets b
-         WHERE ((year < ?) OR (year = ? AND month < ?))
-         AND year = (SELECT MAX(year) FROM budgets WHERE (year < ?) OR (year = ? AND month < ?))
+         WHERE user_id = ? AND ((year < ?) OR (year = ? AND month < ?))
+         AND year = (SELECT MAX(year) FROM budgets WHERE user_id = ? AND ((year < ?) OR (year = ? AND month < ?)))
          ORDER BY month DESC`,
-        [year, year, month, year, year, month]
+        [u, year, year, month, u, year, year, month]
       );
       if (prior.length) {
         inherited = true;
@@ -323,9 +365,9 @@ router.post('/budgets/:year/:month', async (req, res, next) => {
     const { budgets } = req.body; // [{category_id, amount}]
     if (!Array.isArray(budgets)) return res.status(400).json({ error: 'budgets array required' });
     const stmts = budgets.map((item) => ({
-      sql: `INSERT INTO budgets (year, month, category_id, amount) VALUES (?, ?, ?, ?)
+      sql: `INSERT INTO budgets (year, month, category_id, amount, user_id) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(year, month, category_id) DO UPDATE SET amount = excluded.amount`,
-      args: [year, month, item.category_id, item.amount],
+      args: [year, month, item.category_id, item.amount, req.userId],
     }));
     if (stmts.length) await db.batch(stmts, 'write');
     res.json({ ok: true });
@@ -340,7 +382,9 @@ router.get('/recurring', async (req, res, next) => {
     const rows = await q(
       `SELECT r.*, c.name as category_name, c.color as category_color
        FROM recurring_transactions r LEFT JOIN categories c ON c.id = r.category_id
-       ORDER BY r.active DESC, r.day_of_month, r.id`
+       WHERE r.user_id = ?
+       ORDER BY r.active DESC, r.day_of_month, r.id`,
+      [req.userId]
     );
     res.json(rows);
   } catch (e) {
@@ -356,8 +400,8 @@ router.post('/recurring', async (req, res, next) => {
     }
     const result = await db.execute({
       sql: `INSERT INTO recurring_transactions
-            (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+            (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
       args: [
         category_id || null,
         store || null,
@@ -367,9 +411,13 @@ router.post('/recurring', async (req, res, next) => {
         day_of_month || 1,
         start_year,
         start_month,
+        req.userId,
       ],
     });
-    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [num(result.lastInsertRowid)]);
+    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ? AND user_id = ?', [
+      num(result.lastInsertRowid),
+      req.userId,
+    ]);
     res.json(row);
   } catch (e) {
     next(e);
@@ -378,13 +426,16 @@ router.post('/recurring', async (req, res, next) => {
 
 router.put('/recurring/:id', async (req, res, next) => {
   try {
-    const existing = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [req.params.id]);
+    const existing = await qOne('SELECT * FROM recurring_transactions WHERE id = ? AND user_id = ?', [
+      req.params.id,
+      req.userId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'not found' });
     const { category_id, store, amount, note, payment_method, day_of_month, active } = req.body;
     await db.execute({
       sql: `UPDATE recurring_transactions
             SET category_id=?, store=?, amount=?, note=?, payment_method=?, day_of_month=?, active=?
-            WHERE id=?`,
+            WHERE id=? AND user_id=?`,
       args: [
         category_id !== undefined ? category_id : existing.category_id,
         store !== undefined ? store : existing.store,
@@ -394,9 +445,13 @@ router.put('/recurring/:id', async (req, res, next) => {
         day_of_month ?? existing.day_of_month,
         active !== undefined ? (active ? 1 : 0) : existing.active,
         req.params.id,
+        req.userId,
       ],
     });
-    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ?', [req.params.id]);
+    const row = await qOne('SELECT * FROM recurring_transactions WHERE id = ? AND user_id = ?', [
+      req.params.id,
+      req.userId,
+    ]);
     res.json(row);
   } catch (e) {
     next(e);
@@ -405,7 +460,10 @@ router.put('/recurring/:id', async (req, res, next) => {
 
 router.delete('/recurring/:id', async (req, res, next) => {
   try {
-    await db.execute({ sql: 'DELETE FROM recurring_transactions WHERE id = ?', args: [req.params.id] });
+    await db.execute({
+      sql: 'DELETE FROM recurring_transactions WHERE id = ? AND user_id = ?',
+      args: [req.params.id, req.userId],
+    });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -416,16 +474,21 @@ router.delete('/recurring/:id', async (req, res, next) => {
 router.get('/transactions', async (req, res, next) => {
   try {
     const { year, month } = req.query;
-    if (year && month) await ensureRecurringGenerated(year, month);
+    const u = req.userId;
+    if (year && month) await ensureRecurringGenerated(u, year, month);
     let rows;
     const base = `SELECT t.*, c.name as category_name, c.color as category_color, c.type as category_type
        FROM transactions t LEFT JOIN categories c ON c.id = t.category_id`;
     if (year && month) {
-      rows = await q(`${base} WHERE t.year = ? AND t.month = ? ORDER BY t.date DESC, t.id DESC`, [year, month]);
+      rows = await q(`${base} WHERE t.user_id = ? AND t.year = ? AND t.month = ? ORDER BY t.date DESC, t.id DESC`, [
+        u,
+        year,
+        month,
+      ]);
     } else if (year) {
-      rows = await q(`${base} WHERE t.year = ? ORDER BY t.date DESC, t.id DESC`, [year]);
+      rows = await q(`${base} WHERE t.user_id = ? AND t.year = ? ORDER BY t.date DESC, t.id DESC`, [u, year]);
     } else {
-      rows = await q(`${base} ORDER BY t.date DESC, t.id DESC LIMIT 200`);
+      rows = await q(`${base} WHERE t.user_id = ? ORDER BY t.date DESC, t.id DESC LIMIT 200`, [u]);
     }
     res.json(rows);
   } catch (e) {
@@ -440,6 +503,7 @@ router.post('/transactions', async (req, res, next) => {
       return res.status(400).json({ error: 'date and amount are required' });
     }
     const [y, m, d] = date.split('-').map(Number);
+    const u = req.userId;
 
     // Optionally spin up a recurring template at the same time, and link
     // this transaction to it as its first occurrence.
@@ -447,16 +511,16 @@ router.post('/transactions', async (req, res, next) => {
     if (make_recurring) {
       const recurring = await db.execute({
         sql: `INSERT INTO recurring_transactions
-              (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-        args: [category_id || null, store || null, amount, note || null, payment_method || 'debit', d, y, m],
+              (category_id, store, amount, note, payment_method, day_of_month, start_year, start_month, active, user_id)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        args: [category_id || null, store || null, amount, note || null, payment_method || 'debit', d, y, m, u],
       });
       recurringId = num(recurring.lastInsertRowid);
     }
 
     const result = await db.execute({
-      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`,
+      sql: `INSERT INTO transactions (date, year, month, amount, category_id, store, note, payment_method, source, recurring_id, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?)`,
       args: [
         date,
         Number(y),
@@ -467,12 +531,13 @@ router.post('/transactions', async (req, res, next) => {
         note || null,
         payment_method || 'debit',
         recurringId,
+        u,
       ],
     });
     const row = await qOne(
       `SELECT t.*, c.name as category_name, c.color as category_color, c.type as category_type
-       FROM transactions t LEFT JOIN categories c ON c.id = t.category_id WHERE t.id = ?`,
-      [num(result.lastInsertRowid)]
+       FROM transactions t LEFT JOIN categories c ON c.id = t.category_id WHERE t.id = ? AND t.user_id = ?`,
+      [num(result.lastInsertRowid), u]
     );
     res.json(row);
   } catch (e) {
@@ -482,13 +547,16 @@ router.post('/transactions', async (req, res, next) => {
 
 router.put('/transactions/:id', async (req, res, next) => {
   try {
-    const existing = await qOne('SELECT * FROM transactions WHERE id = ?', [req.params.id]);
+    const existing = await qOne('SELECT * FROM transactions WHERE id = ? AND user_id = ?', [
+      req.params.id,
+      req.userId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'not found' });
     const { date, amount, category_id, store, note, payment_method } = req.body;
     const finalDate = date ?? existing.date;
     const [y, m] = finalDate.split('-');
     await db.execute({
-      sql: `UPDATE transactions SET date=?, year=?, month=?, amount=?, category_id=?, store=?, note=?, payment_method=? WHERE id=?`,
+      sql: `UPDATE transactions SET date=?, year=?, month=?, amount=?, category_id=?, store=?, note=?, payment_method=? WHERE id=? AND user_id=?`,
       args: [
         finalDate,
         Number(y),
@@ -499,12 +567,13 @@ router.put('/transactions/:id', async (req, res, next) => {
         note ?? existing.note,
         payment_method ?? existing.payment_method,
         req.params.id,
+        req.userId,
       ],
     });
     const row = await qOne(
       `SELECT t.*, c.name as category_name, c.color as category_color, c.type as category_type
-       FROM transactions t LEFT JOIN categories c ON c.id = t.category_id WHERE t.id = ?`,
-      [req.params.id]
+       FROM transactions t LEFT JOIN categories c ON c.id = t.category_id WHERE t.id = ? AND t.user_id = ?`,
+      [req.params.id, req.userId]
     );
     res.json(row);
   } catch (e) {
@@ -514,7 +583,10 @@ router.put('/transactions/:id', async (req, res, next) => {
 
 router.delete('/transactions/:id', async (req, res, next) => {
   try {
-    await db.execute({ sql: 'DELETE FROM transactions WHERE id = ?', args: [req.params.id] });
+    await db.execute({
+      sql: 'DELETE FROM transactions WHERE id = ? AND user_id = ?',
+      args: [req.params.id, req.userId],
+    });
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -525,34 +597,47 @@ router.delete('/transactions/:id', async (req, res, next) => {
 router.get('/dashboard/:year/:month', async (req, res, next) => {
   try {
     const { year, month } = req.params;
-    await ensureRecurringGenerated(year, month);
+    const u = req.userId;
+    await ensureRecurringGenerated(u, year, month);
 
-    let settingsRow = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ?', [year, month]);
+    let settingsRow = await qOne('SELECT * FROM monthly_settings WHERE year = ? AND month = ? AND user_id = ?', [
+      year,
+      month,
+      u,
+    ]);
     if (!settingsRow) {
       settingsRow = await qOne(
         `SELECT * FROM monthly_settings
-         WHERE (year < ?) OR (year = ? AND month < ?)
+         WHERE user_id = ? AND ((year < ?) OR (year = ? AND month < ?))
          ORDER BY year DESC, month DESC LIMIT 1`,
-        [year, year, month]
+        [u, year, year, month]
       );
     }
     const settings = parseSettings(settingsRow);
     const income = totalIncome(settings);
     const goalAmount = savingsGoalAmount(settings);
 
-    const categories = await q('SELECT * FROM categories WHERE archived = 0 ORDER BY type, sort_order, name');
-    let budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ?', [year, month]);
+    const categories = await q(
+      'SELECT * FROM categories WHERE archived = 0 AND user_id = ? ORDER BY type, sort_order, name',
+      [u]
+    );
+    let budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ? AND user_id = ?', [
+      year,
+      month,
+      u,
+    ]);
     if (budgetRows.length === 0) {
       const priorMonth = await qOne(
         `SELECT year, month FROM budgets
-         WHERE (year < ?) OR (year = ? AND month < ?)
+         WHERE user_id = ? AND ((year < ?) OR (year = ? AND month < ?))
          ORDER BY year DESC, month DESC LIMIT 1`,
-        [year, year, month]
+        [u, year, year, month]
       );
       if (priorMonth) {
-        budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ?', [
+        budgetRows = await q('SELECT * FROM budgets WHERE year = ? AND month = ? AND user_id = ?', [
           priorMonth.year,
           priorMonth.month,
+          u,
         ]);
       }
     }
@@ -560,8 +645,8 @@ router.get('/dashboard/:year/:month', async (req, res, next) => {
 
     const spendRows = await q(
       `SELECT category_id, SUM(amount) as total, COUNT(*) as count
-       FROM transactions WHERE year = ? AND month = ? GROUP BY category_id`,
-      [year, month]
+       FROM transactions WHERE year = ? AND month = ? AND user_id = ? GROUP BY category_id`,
+      [year, month, u]
     );
     const spendByCategory = Object.fromEntries(spendRows.map((s) => [s.category_id, s.total]));
 
@@ -594,14 +679,14 @@ router.get('/dashboard/:year/:month', async (req, res, next) => {
     const topTransactions = await q(
       `SELECT t.*, c.name as category_name FROM transactions t
        LEFT JOIN categories c ON c.id = t.category_id
-       WHERE t.year = ? AND t.month = ? ORDER BY t.amount DESC LIMIT 5`,
-      [year, month]
+       WHERE t.year = ? AND t.month = ? AND t.user_id = ? ORDER BY t.amount DESC LIMIT 5`,
+      [year, month, u]
     );
 
     const now = new Date();
     const isCurrentMonth = now.getFullYear() === Number(year) && now.getMonth() + 1 === Number(month);
-    const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
-    const daysLeft = isCurrentMonth ? daysInMonth - now.getDate() : null;
+    const daysInMonthCount = new Date(Number(year), Number(month), 0).getDate();
+    const daysLeft = isCurrentMonth ? daysInMonthCount - now.getDate() : null;
 
     res.json({
       year: Number(year),

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { ready } = require('./db'); // ensures DB schema/seed is initialized
 const routes = require('./routes');
+const { router: authRouter, requireAuth } = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -22,7 +23,12 @@ app.use('/api', (req, res, next) => {
   return res.status(401).json({ error: 'unauthorized' });
 });
 
-app.use('/api', routes);
+// Per-user accounts: /api/auth/signup and /api/auth/login hand out a token,
+// every other /api route requires that token (as "Authorization: Bearer
+// <token>") and gets req.userId from it so each person only ever sees their
+// own data.
+app.use('/api/auth', authRouter);
+app.use('/api', requireAuth, routes);
 
 // basic error handler so a rejected promise doesn't crash the process
 app.use((err, req, res, next) => {
