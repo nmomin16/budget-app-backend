@@ -13,15 +13,24 @@ function cleanUsername(raw) {
   return String(raw || '').trim().toLowerCase();
 }
 
+// Family invite code: whoever creates an account must know this code, so a
+// stranger who stumbles onto the site's URL can't just sign themselves up.
+// Set SIGNUP_CODE as an env var to change it; otherwise this default applies.
+const SIGNUP_CODE = process.env.SIGNUP_CODE || 'momin-family';
+
 router.post('/signup', async (req, res, next) => {
   try {
     const username = cleanUsername(req.body.username);
     const password = String(req.body.password || '');
+    const inviteCode = String(req.body.inviteCode || '').trim();
     if (!username || !password) {
       return res.status(400).json({ error: 'username and password are required' });
     }
     if (password.length < 4) {
       return res.status(400).json({ error: 'password must be at least 4 characters' });
+    }
+    if (inviteCode.toLowerCase() !== SIGNUP_CODE.toLowerCase()) {
+      return res.status(403).json({ error: 'incorrect invite code' });
     }
     const { rows } = await db.execute({ sql: 'SELECT id FROM users WHERE username = ?', args: [username] });
     if (rows.length) {
